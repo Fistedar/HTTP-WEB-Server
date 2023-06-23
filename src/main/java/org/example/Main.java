@@ -1,12 +1,33 @@
 package org.example;
 
 import java.io.IOException;
-
+import java.nio.file.Files;
+import java.nio.file.Path;
 public class Main {
-    private static final int PORT = 9999;
-    private static final int THREAD_POOL_SIZE = 64;
+  public static void main(String[] args) {
+    final var server = new Server();
+    server.addHandler("GET", "/", (request, responseStream) -> {
+      final var filePath = Path.of(".", "public", "index.html");
+        try {
+            Files.probeContentType(filePath);
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
 
-    public static void main(String[] args) {
 
-    }
+        try {
+            Files.size(filePath);
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
+      try {
+        Files.copy(filePath, responseStream);
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
+
+    });
+    server.listen(9999);
+  }
 }
+

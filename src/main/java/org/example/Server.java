@@ -1,104 +1,131 @@
 package org.example;
 
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.file.FileSystem;
-import java.nio.file.FileSystems;
+import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-class Server implements Handler {
-    int threadPoolSize;
-    final static List<String> VALID_PATHS = List.of("/index.html", "/spring.svg", "/spring.png",
-            "/resources.html", "/styles.css", "/app.js", "/links.html", "/forms.html",
-            "/classic.html", "/events.html", "/events.js");
+public class Server {
 
-    public Server(int threadPoolSize) {
-        this.threadPoolSize = threadPoolSize;
-    }
+    private final List<String> validPaths = List.of("/index.html", "/spring.svg", "/spring.png", "/resources.html", "/styles.css", "/app.js", "/links.html", "/forms.html", "/classic.html", "/events.html", "/events.js");
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Handler>> handlers = new ConcurrentHashMap<>();
 
-    public void runServer(int port) {
-        ExecutorService executorService = Executors.newFixedThreadPool(threadPoolSize);
-        try (ServerSocket serverSocket = new ServerSocket(port)) {
+    public void listen(int port) {
+        var poolExecutor = Executors.newFixedThreadPool(64);
+
+        try (final var serverSocket = new ServerSocket(port)) {
+            log("Server start!");
             while (true) {
                 Socket socket = serverSocket.accept();
-                executorService.submit(() -> connection(socket));
+                poolExecutor.submit(() -> handle(socket));
             }
         } catch (IOException e) {
-            e.printStackTrace();
+            e.printStackTrace(System.out);
         }
     }
 
-    public void connection(Socket socket) {
-        try (
-                final var in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                final var out = new BufferedOutputStream(socket.getOutputStream())) {
+    public void handle(Socket socket) {
+        try (final var in = new BufferedInputStream(socket.getInputStream());
+             final var out = new BufferedOutputStream(socket.getOutputStream())
+        ) {
+            log("client connected: " + socket.getRemoteSocketAddress());
+            Request request = new Request(in, 4096);
 
-            final var requestLine = in.readLine();
-            final var parts = requestLine.split(" ");
+            final var requestLine = request.getRequestLine();
+            final var path = request.getPath().split("\\?")[0];
+            final var method = request.getMethod();
+            final var headers = request.getHeaders();
 
-            if (parts.length != 3) {
-                socket.close();
+            if (requestLine == null || path == null || method == null || headers == null) {
+                // just close socket
+                badRequest(out);
+                return;
             }
 
-            ConcurrentHashMap<String, String> queryParams = Request.getQueryParams(parts[1]);
+            if (!handlers.isEmpty() && handlers.get(method).contains(path)) {
+                handlers.get(method).get(path).handle(request, out);
 
-            String path;
-            if (parts[1].contains("?")) {
-                path = parts[1].substring(0, parts[1].indexOf("?"));
             } else {
-                path = parts[1];
+                if (!validPaths.contains(path)) {
+                    notFound(out);
+                    return;
+                }
+                final var filePath = Path.of(".", "public", path);
+                final var mimeType = Files.probeContentType(filePath);
+                // special case for classic
+                if (path.equals("/classic.html")) {
+                    final var template = Files.readString(filePath);
+                    final var content = template.replace(
+                            "{time}",
+                            LocalDateTime.now().toString()
+                    ).getBytes();
+                    normalRequest(out, mimeType, content.length);
+                    out.write(content);
+                    out.flush();
+                    log("classic.html loaded");
+                    return;
+                }
+
+                final var length = Files.size(filePath);
+                normalRequest(out, mimeType, length);
+                Files.copy(filePath, out);
+                log(filePath.getFileName() + " loaded");
+                System.out.println(request.getQueryParams());
             }
+            out.flush();
+        } catch (IOException | URISyntaxException e) {
+            e.printStackTrace(System.out);
+        }
+    }
 
-            if (!VALID_PATHS.contains(path)) {
-                out.write(("HTTP/1.1 404 Not Found\r\n" +
-                        "Content-Length: 0\r\n" +
-                        "Connection: close\r\n" +
-                        "\r\n").getBytes());
-                out.flush();
-            }
+    private void log(String message) {
+        System.out.println("[" + Thread.currentThread().getName() + "] " + message);
+    }
 
-            final var filePath = FileSystems.getDefault().getPath("public", path);
-            final var mimeType = Files.probeContentType(filePath);
-
-            if (path.equals("/classic.html")) {
-                final var template = Files.readString(filePath);
-                final var content = template.replace("{time}", LocalDateTime.now().toString()).getBytes();
-                out.write(("HTTP/1.1 200 OK\r\n" +
+    private void normalRequest(BufferedOutputStream out, String mimeType, long length) throws IOException {
+        out.write((
+                "HTTP/1.1 200 OK\r\n" +
                         "Content-Type: " + mimeType + "\r\n" +
-                        "Content-Length: " + content.length + "\r\n" +
+                        "Content-Length: " + length + "\r\n" +
                         "Connection: close\r\n" +
                         "\r\n"
-                ).getBytes());
-                out.write(content);
-                out.flush();
-            }
-
-            final var length = Files.size(filePath);
-            out.write((
-                    "HTTP/1.1 200 OK\r\n" +
-                            "Content-Type: " + mimeType + "\r\n" +
-                            "Content-Length: " + length + "\r\n" +
-                            "Connection: close\r\n" +
-                            "\r\n"
-            ).getBytes());
-            Files.copy(filePath, out);
-            out.flush();
-
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+        ).getBytes());
+        out.flush();
     }
-    public boolean isValidPath(String path){
-    return VALID_PATHS.contains(path);
+
+    private void badRequest(BufferedOutputStream out) throws IOException {
+        out.write((
+                "HTTP/1.1 400 Bad Request\r\n" +
+                        "Content-Length: 0\r\n" +
+                        "Connection: close\r\n" +
+                        "\r\n"
+        ).getBytes());
+        out.flush();
+    }
+
+    private void notFound(BufferedOutputStream out) throws IOException {
+        out.write((
+                "HTTP/1.1 404 Not found\r\n" +
+                        "Content-Length: 0\r\n" +
+                        "Connection: close\r\n" +
+                        "\r\n"
+        ).getBytes());
+        out.flush();
+    }
+
+    public void addHandler(String method, String path, Handler handler) {
+        if (handlers.contains(method)) {
+            handlers.get(method).put(path, handler);
+        } else {
+            var hashMap = new ConcurrentHashMap<String, Handler>();
+            hashMap.put(path, handler);
+            handlers.put(method, hashMap);
+        }
     }
 }
